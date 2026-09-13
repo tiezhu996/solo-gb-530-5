@@ -20,6 +20,8 @@ type handlers struct {
 	plans       *handler.WorkPermitPlanHandler
 	exposures   *handler.ExposureEntryHandler
 	assessments *handler.DoseBudgetAssessmentHandler
+	measures    *handler.ControlMeasureHandler
+	scenarios   *handler.BudgetScenarioHandler
 	auth        *service.AuthService
 }
 
@@ -41,6 +43,7 @@ func New(db *gorm.DB, cfg config.Config) *gin.Engine {
 	registerWorkPermitPlanRoutes(protected, wired.plans)
 	registerExposureEntryRoutes(protected, wired.exposures)
 	registerDoseBudgetAssessmentRoutes(protected, wired.assessments)
+	registerControlMeasureRoutes(protected, wired.measures, wired.scenarios)
 	protected.GET("/audit", middleware.RBAC(constants.RoleRPOReviewer, constants.RoleAdmin), wired.system.Audit)
 	engine.NoRoute(func(context *gin.Context) {
 		context.JSON(http.StatusNotFound, gin.H{
@@ -66,12 +69,21 @@ func wire(db *gorm.DB, cfg config.Config) handlers {
 		db, assessmentRepository, planRepository, workerRepository, exposureRepository, auditService,
 		cfg.Thresholds.NearLegalRatio, cfg.Thresholds.Version,
 	)
+	measureRepository := repository.NewControlMeasureRepository(db)
+	scenarioRepository := repository.NewBudgetScenarioRepository(db)
+	measureService := service.NewControlMeasureService(measureRepository, auditService)
+	scenarioService := service.NewBudgetScenarioService(
+		db, scenarioRepository, measureRepository, planRepository, workerRepository, exposureRepository,
+		auditService, cfg.Thresholds.NearLegalRatio, cfg.Thresholds.Version,
+	)
 	return handlers{
 		system:      handler.NewSystemHandler(authService, auditService, db),
 		workers:     handler.NewWorkerProfileHandler(workerService),
 		plans:       handler.NewWorkPermitPlanHandler(planService),
 		exposures:   handler.NewExposureEntryHandler(exposureService),
 		assessments: handler.NewDoseBudgetAssessmentHandler(assessmentService),
+		measures:    handler.NewControlMeasureHandler(measureService),
+		scenarios:   handler.NewBudgetScenarioHandler(scenarioService),
 		auth:        authService,
 	}
 }

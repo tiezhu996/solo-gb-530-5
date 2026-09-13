@@ -56,7 +56,7 @@ request "create threshold test worker" 201 POST "/workers" "$planner_token" '{"w
 worker_id="$(jq -r '.data.id' <<<"$last_body")"
 require_json '.data.remaining_legal_msv == 1' "new worker legal margin"
 
-occurred_at="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+occurred_at="$(date -u -d '-2 hours' +'%Y-%m-%dT%H:%M:%SZ')"
 request "create pending exposure" 201 POST "/exposures" "$planner_token" "$(jq -nc --argjson worker "$worker_id" --arg at "$occurred_at" '{worker_id:$worker,source_ref:"QA-SRC-530",occurred_at:$at,dose_msv:0.4,note:"offline QA source"}')"
 exposure_id="$(jq -r '.data.id' <<<"$last_body")"
 require_json '.data.quality_flag == "pending"' "new exposure starts pending"
@@ -81,12 +81,12 @@ request "create comparison plan" 201 POST "/plans" "$planner_token" "$(jq -nc --
 comparison_plan_id="$(jq -r '.data.id' <<<"$last_body")"
 
 period_end="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-request "calculate immutable assessment" 201 POST "/assessments" "$planner_token" "$(jq -nc --argjson plan "$plan_id" --argjson version "$plan_version" --arg end "$period_end" '{plan_id:$plan,period_end:$end,version:$version}')"
+request "calculate immutable assessment" 201 POST "/assessments" "$planner_token" "$(jq -nc --argjson plan "$plan_id" --argjson version "$plan_version" --arg pend "$period_end" '{plan_id:$plan,period_end:$pend,version:$version}')"
 assessment_id="$(jq -r '.data.id' <<<"$last_body")"
 assessed_version="$(jq -r '.data.plan_version' <<<"$last_body")"
 require_json '.data.period_dose_msv == 0.3 and .data.projected_dose_msv == 1.8 and .data.risk_band == "above_legal" and .data.evidence.requires_manual_review == true' "corrected total, projection and threshold escalation"
 
-request "compare two time-weighted scenarios" 200 POST "/assessments/compare" "$planner_token" "$(jq -nc --argjson first "$plan_id" --argjson second "$comparison_plan_id" --arg end "$period_end" '{plan_ids:[$first,$second],period_end:$end}')"
+request "compare two time-weighted scenarios" 200 POST "/assessments/compare" "$planner_token" "$(jq -nc --argjson first "$plan_id" --argjson second "$comparison_plan_id" --arg pend "$period_end" '{plan_ids:[$first,$second],period_end:$pend}')"
 require_json '.data.scenarios | length == 2' "two comparison scenarios"
 
 request "submit assessment to RPO" 200 POST "/assessments/$assessment_id/submit" "$planner_token" "$(jq -nc --argjson version "$assessed_version" '{version:$version}')"
@@ -105,5 +105,90 @@ require_json '(.data | length) >= 8 and ([.data[].action] | index("assessment.re
 
 request "worker total reflects correction" 200 GET "/workers/$worker_id" "$admin_token"
 require_json '.data.period_dose_msv == 0.3' "period total uses original plus reversal plus replacement"
+
+# --- control measure register and budget scenario comparison ---
+
+request "create shielding measure" 201 POST "/measures" "$planner_token" '{"measure_code":"QA-SHD-530","task_category":"Source fixture check","measure_type":"shielding","expected_reduction_pct":40,"effective_from":"2026-01-01T00:00:00Z","effective_to":"2027-01-01T00:00:00Z","basis":"ALARA review 2026-Q1: 5cm lead blanket cuts scatter 40%","enabled":true}'
+shield_measure_id="$(jq -r '.data.id' <<<"$last_body")"
+require_json '.data.enabled == true and .data.expired == false and .data.version == 1' "new measure enabled inside its window"
+
+request "create distance measure" 201 POST "/measures" "$planner_token" '{"measure_code":"QA-DST-530","task_category":"Source fixture check","measure_type":"distance","expected_reduction_pct":25,"effective_from":"2026-01-01T00:00:00Z","effective_to":"2027-01-01T00:00:00Z","basis":"2m standoff markers per RP manual 4.2","enabled":true}'
+distance_measure_id="$(jq -r '.data.id' <<<"$last_body")"
+
+request "duplicate measure code rejected" 409 POST "/measures" "$planner_token" '{"measure_code":"QA-SHD-530","task_category":"Source fixture check","measure_type":"shielding","expected_reduction_pct":30,"effective_from":"2026-01-01T00:00:00Z","effective_to":"2027-01-01T00:00:00Z","basis":"duplicate must fail","enabled":true}'
+require_json '.error.code == "duplicate_measure_code"' "duplicate measure code error"
+
+request "RPO cannot create measure" 403 POST "/measures" "$rpo_token" '{"measure_code":"QA-RPO-530","task_category":"Source fixture check","measure_type":"rotation","expected_reduction_pct":20,"effective_from":"2026-01-01T00:00:00Z","effective_to":"2027-01-01T00:00:00Z","basis":"RPO attempt must fail","enabled":true}'
+
+request "create expired measure" 201 POST "/measures" "$planner_token" '{"measure_code":"QA-ROT-OLD","task_category":"Source fixture check","measure_type":"rotation","expected_reduction_pct":30,"effective_from":"2025-01-01T00:00:00Z","effective_to":"2025-06-01T00:00:00Z","basis":"superseded 2025 rotation scheme","enabled":true}'
+expired_measure_id="$(jq -r '.data.id' <<<"$last_body")"
+require_json '.data.expired == true' "expired flag computed from window"
+
+request "create disabled measure" 201 POST "/measures" "$planner_token" '{"measure_code":"QA-AUT-HOLD","task_category":"Source fixture check","measure_type":"authorization","expected_reduction_pct":10,"effective_from":"2026-01-01T00:00:00Z","effective_to":"2027-01-01T00:00:00Z","basis":"pre-job authorization hold, suspended","enabled":false}'
+disabled_measure_id="$(jq -r '.data.id' <<<"$last_body")"
+require_json '.data.enabled == false' "disabled status registered"
+
+request "create wrong-category measure" 201 POST "/measures" "$planner_token" '{"measure_code":"QA-SHD-OTHER","task_category":"Remote survey","measure_type":"shielding","expected_reduction_pct":35,"effective_from":"2026-01-01T00:00:00Z","effective_to":"2027-01-01T00:00:00Z","basis":"remote survey only shielding","enabled":true}'
+other_measure_id="$(jq -r '.data.id' <<<"$last_body")"
+
+request "invalid measure window rejected" 400 POST "/measures" "$planner_token" '{"measure_code":"QA-BAD-WIN","task_category":"Source fixture check","measure_type":"shielding","expected_reduction_pct":20,"effective_from":"2026-06-01T00:00:00Z","effective_to":"2026-01-01T00:00:00Z","basis":"inverted window must fail","enabled":true}'
+require_json '.error.code == "invalid_window"' "inverted window error"
+
+request "invalid measure type rejected" 400 POST "/measures" "$planner_token" '{"measure_code":"QA-BAD-TYPE","task_category":"Source fixture check","measure_type":"magic","expected_reduction_pct":20,"effective_from":"2026-01-01T00:00:00Z","effective_to":"2027-01-01T00:00:00Z","basis":"unknown type must fail","enabled":true}'
+
+request "enable expired measure blocked" 409 POST "/measures/$expired_measure_id/status" "$planner_token" '{"enabled":true,"version":1}'
+require_json '.error.code == "measure_expired"' "expired measure cannot be enabled"
+
+request "disable distance measure" 200 POST "/measures/$distance_measure_id/status" "$planner_token" '{"enabled":false,"version":1}'
+require_json '.data.enabled == false and .data.version == 2' "measure disabled"
+
+request "re-enable distance measure" 200 POST "/measures/$distance_measure_id/status" "$planner_token" '{"enabled":true,"version":2}'
+require_json '.data.enabled == true and .data.version == 3' "measure re-enabled"
+
+request "stale measure version rejected" 409 POST "/measures/$distance_measure_id/status" "$planner_token" '{"enabled":false,"version":2}'
+require_json '.error.code == "version_conflict"' "optimistic lock on status"
+
+request "update measure basis" 200 PUT "/measures/$shield_measure_id" "$planner_token" '{"task_category":"Source fixture check","measure_type":"shielding","expected_reduction_pct":40,"effective_from":"2026-01-01T00:00:00Z","effective_to":"2027-01-01T00:00:00Z","basis":"ALARA review 2026-Q1 rev2: 5cm lead blanket","version":1}'
+require_json '.data.version == 2' "measure update bumps version"
+
+request "stale measure update rejected" 409 PUT "/measures/$shield_measure_id" "$planner_token" '{"task_category":"Source fixture check","measure_type":"shielding","expected_reduction_pct":40,"effective_from":"2026-01-01T00:00:00Z","effective_to":"2027-01-01T00:00:00Z","basis":"stale write must fail","version":1}'
+require_json '.error.code == "version_conflict"' "optimistic lock on update"
+
+request "RPO cannot update measure" 403 PUT "/measures/$shield_measure_id" "$rpo_token" '{"task_category":"Source fixture check","measure_type":"shielding","expected_reduction_pct":40,"effective_from":"2026-01-01T00:00:00Z","effective_to":"2027-01-01T00:00:00Z","basis":"RPO update must fail","version":2}'
+
+request "list measures filtered" 200 GET "/measures?task_category=Source%20fixture%20check&enabled=true" "$planner_token"
+require_json '(.data | length) == 3' "category and enabled filters"
+
+request "scenario with shielding and distance" 201 POST "/scenarios" "$planner_token" "$(jq -nc --argjson plan "$plan_id" --argjson shield "$shield_measure_id" --argjson distance "$distance_measure_id" '{plan_id:$plan,measure_ids:[$shield,$distance]}')"
+scenario_id="$(jq -r '.data.id' <<<"$last_body")"
+require_json '.data.baseline.projected_dose_msv == 1.8 and .data.mitigated.projected_dose_msv == 0.975' "before and after projections"
+require_json '.data.baseline.risk_band == "above_legal" and .data.mitigated.risk_band == "near_legal"' "risk band comparison"
+require_json '.data.reduction_factor == 0.45 and .data.saved_dose_msv == 0.825' "combined reduction factor and saved dose"
+require_json '.data.formula_version == "MEASURE-2026.1" and .data.evidence.formula_version == "MEASURE-2026.1" and (.data.measures | length) == 2' "frozen formula version and measure snapshots"
+
+request "expired measure in scenario blocked" 409 POST "/scenarios" "$planner_token" "$(jq -nc --argjson plan "$plan_id" --argjson measure "$expired_measure_id" '{plan_id:$plan,measure_ids:[$measure]}')"
+require_json '.error.code == "measure_expired"' "expired measure cannot be referenced"
+
+request "disabled measure in scenario blocked" 409 POST "/scenarios" "$planner_token" "$(jq -nc --argjson plan "$plan_id" --argjson measure "$disabled_measure_id" '{plan_id:$plan,measure_ids:[$measure]}')"
+require_json '.error.code == "measure_not_enabled"' "disabled measure cannot be referenced"
+
+request "category mismatch in scenario blocked" 409 POST "/scenarios" "$planner_token" "$(jq -nc --argjson plan "$plan_id" --argjson measure "$other_measure_id" '{plan_id:$plan,measure_ids:[$measure]}')"
+require_json '.error.code == "measure_category_mismatch"' "measure category must match plan task"
+
+request "duplicate measure in scenario blocked" 400 POST "/scenarios" "$planner_token" "$(jq -nc --argjson plan "$plan_id" --argjson measure "$shield_measure_id" '{plan_id:$plan,measure_ids:[$measure,$measure]}')"
+require_json '.error.code == "duplicate_measure"' "duplicate measure reference"
+
+request "unknown measure in scenario blocked" 404 POST "/scenarios" "$planner_token" "$(jq -nc --argjson plan "$plan_id" '{plan_id:$plan,measure_ids:[99999]}')"
+
+request "RPO cannot create scenario" 403 POST "/scenarios" "$rpo_token" "$(jq -nc --argjson plan "$plan_id" --argjson measure "$shield_measure_id" '{plan_id:$plan,measure_ids:[$measure]}')"
+
+request "list scenarios for plan" 200 GET "/scenarios?plan_id=$plan_id" "$rpo_token"
+require_json '(.data | length) == 1 and .data[0].scenario_code != ""' "scenario register lists immutable comparison"
+
+request "get scenario detail" 200 GET "/scenarios/$scenario_id" "$admin_token"
+require_json '.data.evidence.boundary_statement != "" and .data.threshold_version == "ALARA-2026.1"' "scenario evidence and threshold version"
+
+request "audit contains measure and scenario events" 200 GET "/audit?resource_type=control_measure" "$rpo_token"
+require_json '([.data[].action] | index("measure.enabled")) != null and ([.data[].action] | index("measure.disabled")) != null' "measure status changes audited"
 
 printf 'ALL %d API CHECKS PASSED\n' "$checks"

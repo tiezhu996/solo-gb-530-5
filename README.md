@@ -48,6 +48,8 @@ docker compose down -v --remove-orphans
 - 不可变更正：原值禁止覆盖；一次更正事务创建负值 reversal 和新 replacement，完整保留链路。
 - 作业计划：使用统一 mSv/mSv/h 单位维护剂量率、分钟数和具体控制措施。
 - 剂量评估：冻结人员/计划版本、期间记录 ID、公式、阈值版本和控制措施，结果追加写入而非覆盖。
+- 控制措施台：按作业类别登记屏蔽、距离、轮换和授权措施，维护预计剂量折减、生效期、依据和启用状态；重复编码、过期启用和越权修改会被拦截。
+- 预算情景对照：创建情景时选用生效期内的启用措施，连乘合成折减系数，生成采用前后对照并冻结措施快照、公式版本和证据。
 - 情景比较：对同一人员的多个计划做时间加权投影并比较风险带，不落库、不改变状态。
 - 人工状态机：`draft -> assessed -> pending_rpo_review -> planning_accepted | rejected -> archived`。
 - 操作审计：记录 request ID、操作者、参数摘要与前后状态；普通 API 不提供删除能力。
@@ -62,6 +64,17 @@ docker compose down -v --remove-orphans
 行政余量 = max(0, administrative_limit_msv - 投影累计)
 法规余量 = max(0, annual_limit_msv - 投影累计)
 ```
+
+预算情景的采用前后对照：
+
+```text
+折减系数 = Π(1 - expected_reduction_pct ÷ 100)   # 选用措施连乘，避免线性叠加超过 100%
+采用前计划增量 = estimated_rate_msvh × planned_minutes ÷ 60
+采用后计划增量 = 采用前计划增量 × 折减系数
+两侧投影 = 期间已核验剂量合计 + 各自计划增量
+```
+
+- 折减公式版本默认 `MEASURE-2026.1`，与阈值版本一起冻结进情景证据。
 
 - 期间采用半开区间 `[period_start, period_end)`，边界有表驱动测试。
 - 仅 `quality_flag=verified` 的记录参与汇总；pending/rejected 会写入排除证据。
@@ -101,7 +114,7 @@ docker compose down -v --remove-orphans
 │   ├── api/                        # 按实体拆分 API 客户端
 │   ├── components/common/          # 风险带、证据、安全边界
 │   ├── hooks/                      # useAuth、useBudgetAssessment
-│   ├── pages/                      # workers/plans/exposures/budgets/audit
+│   ├── pages/                      # workers/plans/measures/exposures/budgets/audit
 │   ├── router/                     # 登录、认证与 RPO 守卫
 │   ├── stores/                     # 按领域拆分信号状态
 │   ├── types/                      # 前端共享枚举和实体
@@ -129,9 +142,12 @@ docker compose down -v --remove-orphans
 | POST | `/assessments/compare` | 同一人员多计划情景比较 |
 | POST | `/assessments/:id/submit` | 提交 RPO 人工复核 |
 | POST | `/assessments/:id/review` | RPO 记录规划接受或拒绝 |
+| GET/POST/PUT | `/measures[/:id]` | 控制措施列表、详情、创建和乐观锁更新 |
+| POST | `/measures/:id/status` | 启用或停用措施（过期措施禁止启用） |
+| GET/POST | `/scenarios[/:id]` | 预算情景列表、详情和采用前后对照生成 |
 | GET | `/audit` | RPO/admin 查询审计 |
 
-错误统一为 `error.code`、`error.message` 和 `request_id`。常见冲突包括 `duplicate_source_ref`、`correction_chain_conflict`、`invalid_state`、`version_conflict` 和 `forbidden`。
+错误统一为 `error.code`、`error.message` 和 `request_id`。常见冲突包括 `duplicate_source_ref`、`correction_chain_conflict`、`invalid_state`、`version_conflict`、`duplicate_measure_code`、`measure_expired`、`measure_not_enabled`、`measure_category_mismatch` 和 `forbidden`。
 
 ## 枚举位置
 
@@ -145,6 +161,17 @@ docker compose down -v --remove-orphans
 - 前端类型/store/component/page：`frontend/src/app/types/permit.ts`、`stores/plans.store.ts`、`components/common/budget-evidence-panel.component.ts`、`pages/plans.page.ts`、`pages/budgets.page.ts`、`pages/audit.page.ts`
 
 `planning_accepted` 的含义仅为“规划证据已由 RPO 记录处置”，不等于现场许可。
+
+### MeasureType
+
+值：`shielding | distance | rotation | authorization`。
+
+- 数据库/model：`backend/internal/model/control_measure.go`
+- 后端常量：`backend/internal/constants/measure.go`
+- 后端算法/DTO/service/handler：`backend/internal/dosebudget/measure.go`、`backend/internal/dto/control_measure.go`、`backend/internal/service/control_measure.go`、`backend/internal/service/budget_scenario.go`、`backend/internal/handler/control_measure.go`
+- 前端类型/store/page：`frontend/src/app/types/measure.ts`、`stores/measures.store.ts`、`pages/measures.page.ts`
+
+措施仅在生效窗口 `[effective_from, effective_to)` 内且 `enabled=true` 时可被预算情景引用；情景一旦生成即冻结措施快照与 `MEASURE-2026.1` 公式版本，后续措施变更不回写历史情景。
 
 ### DoseBand
 
@@ -203,7 +230,7 @@ scripts/api_smoke.sh
 
 - 人员档案只保存规划所需的编号、显示名、授权概况和限值，不保存诊断、治疗或病历。
 - API 和结构化访问日志不记录 JWT、密码、完整请求体或 RPO 备注正文；审计仅记录备注长度。
-- planner 不能执行 RPO 复核，RPO 不能创建人员或计划；权限同时由后端中间件、路由守卫和按钮显隐实施。
+- planner 不能执行 RPO 复核，RPO 不能创建人员、计划、控制措施或预算情景；权限同时由后端中间件、路由守卫和按钮显隐实施。
 - 多步更正、评估、提交和复核使用数据库事务；状态变化使用条件更新与版本检查。
 - 不包含排班预约、工单、财务、计费、库存、绩效、设备接入或实时采集能力。
 
