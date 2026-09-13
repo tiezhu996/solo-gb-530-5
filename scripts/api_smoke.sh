@@ -42,12 +42,21 @@ require_json() {
 }
 
 utc_hours_ago() {
-  # GNU date (Linux) uses -d; BSD date (macOS) uses -v. Try GNU first, fall back to BSD.
-  if result="$(date -u -d "-$1 hours" +'%Y-%m-%dT%H:%M:%SZ' 2>/dev/null)"; then
-    printf '%s\n' "$result"
-  else
-    date -u -v-"$1"H +'%Y-%m-%dT%H:%M:%SZ'
+  # GNU date (Linux) uses -d; BSD date (macOS) uses -v. Try GNU first and keep its
+  # stderr as a diagnostic when the compatibility fallback is needed.
+  local probe
+  if probe="$(date -u -d "-$1 hours" +'%Y-%m-%dT%H:%M:%SZ' 2>&1)"; then
+    printf '%s\n' "$probe"
+    return 0
   fi
+  local fallback
+  if fallback="$(date -u -v-"$1"H +'%Y-%m-%dT%H:%M:%SZ' 2>&1)"; then
+    printf 'utc_hours_ago: GNU date probe failed (%s); used BSD date -v fallback\n' "$probe" >&2
+    printf '%s\n' "$fallback"
+    return 0
+  fi
+  printf 'utc_hours_ago: GNU date probe failed (%s) and BSD date fallback failed (%s)\n' "$probe" "$fallback" >&2
+  return 1
 }
 
 request "unauthenticated workers denied" 401 GET "/workers"
