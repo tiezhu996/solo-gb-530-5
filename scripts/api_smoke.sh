@@ -41,6 +41,15 @@ require_json() {
   fi
 }
 
+utc_hours_ago() {
+  # GNU date (Linux) uses -d; BSD date (macOS) uses -v. Try GNU first, fall back to BSD.
+  if result="$(date -u -d "-$1 hours" +'%Y-%m-%dT%H:%M:%SZ' 2>/dev/null)"; then
+    printf '%s\n' "$result"
+  else
+    date -u -v-"$1"H +'%Y-%m-%dT%H:%M:%SZ'
+  fi
+}
+
 request "unauthenticated workers denied" 401 GET "/workers"
 
 request "planner login" 200 POST "/auth/login" "" '{"username":"planner","password":"Planner#530"}'
@@ -56,7 +65,7 @@ request "create threshold test worker" 201 POST "/workers" "$planner_token" '{"w
 worker_id="$(jq -r '.data.id' <<<"$last_body")"
 require_json '.data.remaining_legal_msv == 1' "new worker legal margin"
 
-occurred_at="$(date -u -d '-2 hours' +'%Y-%m-%dT%H:%M:%SZ')"
+occurred_at="$(utc_hours_ago 2)"
 request "create pending exposure" 201 POST "/exposures" "$planner_token" "$(jq -nc --argjson worker "$worker_id" --arg at "$occurred_at" '{worker_id:$worker,source_ref:"QA-SRC-530",occurred_at:$at,dose_msv:0.4,note:"offline QA source"}')"
 exposure_id="$(jq -r '.data.id' <<<"$last_body")"
 require_json '.data.quality_flag == "pending"' "new exposure starts pending"
